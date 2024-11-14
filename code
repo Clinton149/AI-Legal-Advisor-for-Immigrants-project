@@ -1,0 +1,169 @@
+# Install necessary libraries
+!pip install --upgrade gradio
+!pip install langchain openai faiss-cpu tiktoken gtts
+
+import os
+import glob
+from getpass import getpass
+import gradio as gr
+from langchain import OpenAI
+from langchain.chains import RetrievalQA
+from langchain.vectorstores import FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.prompts import PromptTemplate
+import tempfile
+import shutil
+
+# Securely input your OpenAI API key
+api_key = getpass("Enter your OpenAI API key: ")
+
+# Create sample legal documents
+sample_docs = [
+    """Immigration Law Section 1: Visas
+
+An individual seeking to enter the country must obtain a valid visa unless they are from a visa-exempt country. Visas must be applied for at the country's consulate or embassy in the applicant's home country.
+
+Key Points:
+- Types of visas include tourist, student, and work visas.
+- Visa applications require a valid passport and supporting documents.
+- Overstaying a visa can result in penalties or deportation.
+""",
+    """Immigration Law Section 2: Asylum Seekers
+
+Asylum seekers are individuals who seek protection because they have suffered persecution or fear that they will suffer persecution due to race, religion, nationality, membership in a particular social group, or political opinion.
+
+Key Points:
+- Asylum applications must be made within one year of arrival.
+- Applicants must be physically present in the country.
+- Asylum seekers may include their spouse and children in the application.
+""",
+    """Immigration Law Section 3: Naturalization
+
+Naturalization is the process by which a non-citizen voluntarily becomes a citizen of the country. Applicants must meet certain requirements set by immigration law.
+
+Key Points:
+- Must be at least 18 years old.
+- Must have lawful permanent resident status for at least 5 years.
+- Must demonstrate continuous residence and good moral character.
+- Must pass English language and civics tests.
+"""
+]
+
+# Save sample documents to text files
+for idx, doc in enumerate(sample_docs):
+    with open(f'doc_{idx}.txt', 'w') as f:
+        f.write(doc)
+
+# Function to process uploaded files and existing documents
+def process_documents(files):
+    # Load existing documents
+    documents = []
+    for filepath in glob.glob('doc_*.txt'):
+        loader = TextLoader(filepath)
+        documents.extend(loader.load())
+    
+    # Process uploaded files
+    if files:
+        for file in files:
+            file_path = file.name
+            # Copy the uploaded file to the current directory
+            shutil.copy(file_path, os.path.basename(file_path))
+            loader = TextLoader(os.path.basename(file_path))
+            documents.extend(loader.load())
+    
+    # Split documents into chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    docs = text_splitter.split_documents(documents)
+    
+    # Create embeddings
+    embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+    
+    # Build the vector store
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    
+    # Return the retriever
+    return vectorstore.as_retriever()
+
+# Create a custom prompt template
+prompt_template = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are an AI legal advisor specializing in immigration law. Use the following context to answer the question accurately and thoroughly. If the answer is not contained within the context, politely inform the user that you cannot provide that information.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+)
+
+# Initialize the OpenAI LLM
+llm = OpenAI(temperature=0, openai_api_key=api_key)
+
+# Define the chatbot function
+def chatbot(question, files):
+    retriever = process_documents(files)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": prompt_template}
+    )
+    answer = qa_chain.run(question)
+    return answer
+
+# Create the Gradio interface
+def get_answer(text_input, audio_input, files):
+    # Choose the input that is provided
+    if text_input:
+        question = text_input
+    elif audio_input:
+        # Process the audio input
+        # Transcribe the audio input using OpenAI Whisper API
+        import openai
+        openai.api_key = api_key
+        audio_file = open(audio_input, "rb")
+        transcript = openai.Audio.transcribe("whisper-1", audio_file)
+        question = transcript["text"]
+    else:
+        return "Please provide a question either by typing or speaking.", None
+
+    answer = chatbot(question, files)
+
+    # Generate audio response
+    import gtts
+    tts = gtts.gTTS(answer)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tts.save(temp_file.name)
+    audio_path = temp_file.name
+
+    return answer, audio_path
+
+# Define the Gradio interface components
+with gr.Blocks() as demo:
+    gr.Markdown("## AI Legal Advisor for Immigrants")
+    gr.Markdown("Ask your legal questions by typing or speaking, and optionally upload documents for the AI to reference.")
+    
+    with gr.Row():
+        with gr.Column():
+            file_upload = gr.File(label="Upload Documents (Optional)", file_types=['.txt'], file_count="multiple")
+            text_input = gr.Textbox(label="Your Question", placeholder="Type your question here...", lines=2)
+            audio_input = gr.Audio(label="Or Speak Your Question", type="filepath")
+            submit_button = gr.Button("Get Answer")
+        with gr.Column():
+            answer_output = gr.Textbox(label="Answer", placeholder="The AI's response will appear here.")
+            audio_output = gr.Audio(label="Audio Response", type="filepath")
+
+    submit_button.click(
+        get_answer,
+        inputs=[text_input, audio_input, file_upload],
+        outputs=[answer_output, audio_output]
+    )
+
+# Launch the Gradio app
+demo.launch()
